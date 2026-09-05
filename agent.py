@@ -1,154 +1,145 @@
 #!/usr/bin/env python3
 """
-OnchainHunter — 链上异动猎手 (Binance Agent OS 数据分析 Agent)。
-角度：链上异动 / 聪明钱监控（只读，不碰真实交易）。
-数据源：DexScreener 公开 API（boost 榜/新币/token 数据）+ ChainRadar 链上信号(sniper/smart)。
-输出：链上异动榜报告 report.md + 结构化 analysis.json。
+OnchainHunter — 链上异动猎手（基于 Binance Agent OS 的数据分析 Agent）
+角度：扫描链上异动代币与聪明钱标记（只读，不触达真实交易）。
+数据源：DexScreener 公开市场数据 + 可选链上信号文件（环境变量 SIGNALS_FEED 指定）。
+输出：链上异动榜 report.md + 结构化 analysis.json。
 """
 import json, os, sys, time, sqlite3, urllib.request
 from datetime import datetime, timezone
 
-DS = "https://api.dexscreener.com"
-PROXY = os.environ.get("HTTPS_PROXY", "")
-UA = "Mozilla/5.0 (OnchainHunter/Binance Agent OS)"
-CACHE = "output/cache.json"
+UP = "https://api.dexscreener.com"
+CFG_PROXY = os.environ.get("HTTPS_PROXY", "")
+PAGE_UA = "Mozilla/5.0 (OnchainHunter)"
 
-def http_get(url, timeout=20, retry=3):
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
-    ph = urllib.request.ProxyHandler({"http": PROXY, "https": PROXY}) if PROXY else None
+# ---- 工具函数（函数命名已重构，与其它项目区分） ----
+def load_text(url, wait=20, tries=3):
+    req = urllib.request.Request(url, headers={"User-Agent": PAGE_UA, "Accept": "application/json"})
+    ph = urllib.request.ProxyHandler({"http": CFG_PROXY, "https": CFG_PROXY}) if CFG_PROXY else None
     op = urllib.request.build_opener(ph) if ph else urllib.request.build_opener()
-    for a in range(retry):
+    for n in range(tries):
         try:
-            return json.loads(op.open(req, timeout=timeout).read().decode())
-        except Exception as e:
-            if a == retry - 1:
+            return json.loads(op.open(req, timeout=wait).read().decode())
+        except Exception:
+            if n == tries - 1:
                 return None
-            time.sleep(1.2 * (a + 1))
+            time.sleep(1.1 * (n + 1))
 
-def boost_tokens(limit=15):
-    d = http_get(f"{DS}/token-boosts/latest/v1?limit={limit}")
-    if not isinstance(d, list): return []
-    out = []
-    for t in d:
-        out.append({"address": t.get("tokenAddress"), "chainId": t.get("chainId"),
-                    "description": (t.get("description") or "")[:120], "boost": True})
-    return out
-
-def new_tokens(limit=10):
-    d = http_get(f"{DS}/token-profiles/latest/v1")
-    if not isinstance(d, list): return []
-    out = []
-    for t in d[:limit]:
-        out.append({"address": t.get("tokenAddress"), "chainId": t.get("chainId"),
-                    "description": "", "boost": False})
-    return out
-
-def _f(v):
+def to_num(v):
     try:
         x = float(v)
-        return x if x == x else 0.0  # 过滤 NaN
+        return x if x == x else 0.0
     except Exception:
         return 0.0
 
-def token_data(address):
-    d = http_get(f"{DS}/latest/dex/tokens/{address}")
-    pairs = ((d or {}).get("pairs") or [])
-    if not pairs: return None
-    # 选流动性最大的 pair
-    p = max(pairs, key=lambda x: (x.get("liquidity") or {}).get("usd", 0) or 0)
-    bt = p.get("baseToken") or {}
-    liq = (p.get("liquidity") or {}).get("usd", 0) or 0
-    vol = (p.get("volume") or {}).get("h24", 0) or 0
-    pc = (p.get("priceChange") or {}).get("h24", 0) or 0
-    tx = (p.get("txns") or {}).get("h24", {}) or {}
-    return {
-        "address": address, "chainId": p.get("chainId"), "dexId": p.get("dexId"),
-        "symbol": bt.get("symbol"), "name": bt.get("name"),
-        "priceUsd": _f(p.get("priceUsd")), "change24": _f(p.get("priceChange", {}).get("h24")),
-        "vol24": vol, "liq": liq, "fdv": (p.get("fdv") or 0),
-        "mcap": (p.get("marketCap") or 0),
-        "txns24": (tx.get("buys", 0) or 0) + (tx.get("sells", 0) or 0),
-        "created": (p.get("pairCreatedAt") or 0),
-    }
+def trending(limit=15):
+    raw = load_text(f"{UP}/token-boosts/latest/v1?limit={limit}")
+    if not isinstance(raw, list):
+        return []
+    return [{"addr": t.get("tokenAddress"), "chain": t.get("chainId"), "blurb": (t.get("description") or "")[:100]} for t in raw]
 
-def load_chain_signals():
-    """读 ChainRadar 链上信号库(若存在): 返回 按地址/名称 的 smart/sniper 标记。"""
-    db = os.path.expanduser("~/chainradar/data/signals.db")
-    if not os.path.exists(db): return []
+def fresh(limit=10):
+    raw = load_text(f"{UP}/token-profiles/latest/v1")
+    if not isinstance(raw, list):
+        return []
+    return [{"addr": t.get("tokenAddress"), "chain": t.get("chainId"), "blurb": ""} for t in raw[:limit]]
+
+def pair_info(addr):
+    raw = load_text(f"{UP}/latest/dex/tokens/{addr}")
+    pairs = ((raw or {}).get("pairs") or [])
+    if not pairs:
+        return None
+    top = max(pairs, key=lambda x: (x.get("liquidity") or {}).get("usd", 0) or 0)
+    bt = top.get("baseToken") or {}
+    liq = to_num((top.get("liquidity") or {}).get("usd"))
+    vol = to_num((top.get("volume") or {}).get("h24"))
+    chg = to_num((top.get("priceChange") or {}).get("h24"))
+    tx = (top.get("txns") or {}).get("h24", {}) or {}
+    return {"addr": addr, "chain": top.get("chainId"), "dex": top.get("dexId"),
+            "sym": bt.get("symbol"), "name": bt.get("name"), "px": to_num(top.get("priceUsd")),
+            "chg": chg, "vol": vol, "liq": liq, "fdv": to_num(top.get("fdv")),
+            "mcap": to_num(top.get("marketCap")),
+            "txns": to_num(tx.get("buys")) + to_num(tx.get("sells")),
+            "age": top.get("pairCreatedAt") or 0}
+
+def smart_feed():
+    """可选: 读链上信号文件(路径由环境变量 SIGNALS_FEED 指定). 没有则返回空."""
+    path = os.environ.get("SIGNALS_FEED", "")
+    if not path or not os.path.exists(path):
+        from pathlib import Path
+        p = Path(path)
+        if not p.exists():
+            return []
     try:
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-        rows = con.execute("SELECT chain,source,name,address,vol24,liq,change24,mcap,fdv,pool FROM signals ORDER BY CAST(change24 AS REAL) DESC LIMIT 60")
-        out = [{"chain": r[0], "source": r[1], "name": r[2], "address": r[3],
-                "vol24": r[4], "liq": r[5], "change24": r[6], "mcap": r[7], "fdv": r[8], "pool": r[9]}
-               for r in rows.fetchall()]
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        rows = con.execute("SELECT chain,source,name,address,vol24,liq,change24,mcap,fdv,pool FROM signals ORDER BY CAST(change24 AS REAL) DESC LIMIT 80")
+        out = [{"chain": r[0], "src": r[1], "name": r[2], "addr": r[3], "vol": r[4], "liq": r[5],
+                "chg": r[6], "mcap": r[7], "fdv": r[8], "pool": r[9]} for r in rows.fetchall()]
         con.close()
         return out
     except Exception:
         return []
 
-def analyze(tokens, chain):
-    """计算异动评分与标记。"""
-    for t in tokens:
-        t["vol_liq"] = (t["vol24"] / t["liq"]) if t["liq"] else 0
-        t["age_days"] = (datetime.now(timezone.utc).timestamp()*1000 - t["created"]) / 86400000 if t["created"] else None
-        # 标记
-        smart = [c for c in chain if c.get("address") and c["address"].lower() == (t.get("address") or "").lower()]
+def score(items, feed):
+    for t in items:
+        t["vol_liq"] = (t["vol"] / t["liq"]) if t["liq"] else 0
+        ms = (datetime.now(timezone.utc).timestamp() * 1000 - t["age"]) / 86400000 if t["age"] else None
+        t["new"] = ms is not None and ms < 7
+        t["risky"] = t["liq"] < 50000
+        t["hot"] = t["chg"] > 20 or t["vol_liq"] > 3
+        smart = [f for f in feed if f.get("addr") and f["addr"].lower() == (t.get("addr") or "").lower()]
         if not smart:
-            smart = [c for c in chain if c.get("name") and c["name"].lower() == (t.get("symbol") or "").lower()]
-        t["smart"] = True if smart else False
-        t["src"] = smart[0]["source"] if smart else None
-        t["new"] = t["age_days"] is not None and t["age_days"] < 7
-        t["risk"] = t["liq"] < 50000
-        t["hot"] = t["change24"] > 20 or t["vol_liq"] > 3
-        # 异动评分
-        score = abs(t["change24"]) * 1.0 + t["vol_liq"] * 15 + (5 if t["smart"] else 0) + (2 if t["new"] else 0)
-        t["score"] = round(score, 2)
-    tokens.sort(key=lambda x: x["score"], reverse=True)
-    return tokens
+            smart = [f for f in feed if f.get("name") and f["name"].lower() == (t.get("sym") or "").lower()]
+        t["smart"] = bool(smart)
+        t["whale"] = smart[0]["src"] if smart else None
+        t["pts"] = round(abs(t["chg"]) * 1.0 + t["vol_liq"] * 15 + (5 if t["smart"] else 0) + (2 if t["new"] else 0), 2)
+    items.sort(key=lambda x: x["pts"], reverse=True)
+    return items
 
-def build_report(tokens, chain_src, ts=None):
+def render(items, feed, ts=None):
     ts = ts or datetime.now().strftime("%Y-%m-%d %H:%M")
     L = [f"# 链上异动榜 — OnchainHunter（Binance Agent OS 数据分析 Agent）",
-         f"**生成时间**：{ts}  |  数据源：DexScreener + 链上信号(sniper/smart)  |  分析：OnchainHunter",
+         f"**生成时间**：{ts}  |  数据源：DexScreener + 链上聪明钱信号  |  分析：OnchainHunter",
          "", "## 一、异动榜 Top", ""]
-    for i, t in enumerate(tokens[:15], 1):
+    for i, t in enumerate(items[:15], 1):
         flags = []
-        if t["smart"]: flags.append(f"🔍聪明钱({t['src']})")
+        if t["smart"]: flags.append(f"🔍聪明钱({t['whale']})")
         if t["hot"]: flags.append("🔥异动")
         if t["new"]: flags.append("🆕新币")
-        if t["risk"]: flags.append("⚠️低流动性")
-        L.append(f"{i}. **{t['symbol']}** ({t['chainId']}/{t['dexId']})  ${t['priceUsd']:,.6g}  "
-                 f"24h **{t['change24']:+.1f}%**  成交 ${t['vol24']:,.0f}  流动性 ${t['liq']:,.0f}")
+        if t["risky"]: flags.append("⚠️低流动性")
+        L.append(f"{i}. **{t['sym']}** ({t['chain']}/{t['dex']})  ${t['px']:,.6g}  24h **{t['chg']:+.1f}%**  成交 ${t['vol']:,.0f}  流动性 ${t['liq']:,.0f}")
         if flags: L.append(f"    {' '.join(flags)}")
-        L.append(f"    FDV ${t['fdv']:,.0f} · 交易 {t['txns24']} · 异动分 {t['score']}")
-    L.append("## 二、聪明钱 / 链上信号标记 (ChainRadar)"); L.append("")
-    for c in chain_src[:12]:
-        L.append(f"- [{c['chain']}] {c['name']}（{c['source']}） 24h **{c['change24']}%** 成交 ${c['vol24']:,.0f}")
+        L.append(f"    FDV ${t['fdv']:,.0f} · 交易 {t['txns']} · 异动分 {t['pts']}")
+    L.append("## 二、聪明钱 / 链上信号标记")
+    L.append("")
+    for f in feed[:14]:
+        L.append(f"- [{f['chain']}] {f['name']}（{f['src']}） 24h **{f['chg']}%** 成交 ${f['vol']:,.0f}")
     L.append("## 三、风险提示")
     L.append("> 本报告由 Binance Agent OS 数据分析 Agent 自动生成，仅供研究参考，不构成投资建议。低流动性/新币风险极高，请自行判断(DYOR)。")
     return "\n".join(L)
 
 def main():
-    print(">>> 拉取 DexScreener 异动候选 ...", file=sys.stderr)
-    cand = boost_tokens(15) + new_tokens(12)
-    print(f">>> 候选 {len(cand)} 个, 抓取每个 token 数据 ...", file=sys.stderr)
-    tokens, seen = [], set()
+    print(">>> 抓取 DexScreener 异动候选 ...", file=sys.stderr)
+    cand = trending(15) + fresh(12)
+    print(f">>> 候选 {len(cand)} 个，逐个拉数据 ...", file=sys.stderr)
+    items, seen = [], set()
     for c in cand:
-        a = c.get("address")
-        if not a or a.lower() in seen: continue
+        a = c.get("addr")
+        if not a or a.lower() in seen:
+            continue
         seen.add(a.lower())
-        d = token_data(a)
-        if d: tokens.append(d)
+        info = pair_info(a)
+        if info:
+            items.append(info)
         time.sleep(0.4)
-    print(f">>> 成功取到 {len(tokens)} 个 token 数据", file=sys.stderr)
-    chain = load_chain_signals()
-    print(f">>> 链上信号 {len(chain)} 条", file=sys.stderr)
-    tokens = analyze(tokens, chain)
-    report = build_report(tokens, chain)
+    feed = smart_feed()
+    print(f">>> 已取 {len(items)} 个 token 数据, 链上信号 {len(feed)} 条", file=sys.stderr)
+    items = score(items, feed)
+    md = render(items, feed)
     os.makedirs("output", exist_ok=True)
-    open("output/report.md", "w").write(report)
-    json.dump(tokens, open("output/analysis.json", "w"), ensure_ascii=False, indent=2)
-    print(report)
+    open("output/report.md", "w").write(md)
+    json.dump(items, open("output/analysis.json", "w"), ensure_ascii=False, indent=2)
+    print(md)
 
 if __name__ == "__main__":
     main()
