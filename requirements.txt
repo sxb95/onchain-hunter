@@ -1,0 +1,5 @@
+# OnchainHunter uses only the Python standard library (urllib/json/sqlite3).
+# No third-party deps required to run agent.py. Optional for demo:
+# Pillow>=10.0
+# imageio>=2.0
+# imageio-ffmpeg>=0.4
